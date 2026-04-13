@@ -1,0 +1,16 @@
+.vs/
+bin/
+obj/
+Debug/
+Release/
+x64/
+Win32/
+*.VC.db
+*.VC.opendb
+*.ilk
+*.log
+*.obj
+*.pdb
+*.sbr
+*.suo
+*.user
