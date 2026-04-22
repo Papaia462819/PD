@@ -1,7 +1,9 @@
 #include <windows.h>
 #include <setupapi.h>
+#include <initguid.h>
 #include <devpkey.h>
 #include <objbase.h>
+#include <wtsapi32.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -137,6 +139,70 @@ namespace
         DWORD index = 0;
         SP_DEVINFO_DATA deviceInfo{};
     };
+
+    class ServiceHandle
+    {
+    public:
+        ServiceHandle() = default;
+
+        explicit ServiceHandle(SC_HANDLE handle) noexcept : handle_(handle)
+        {
+        }
+
+        ServiceHandle(const ServiceHandle&) = delete;
+        ServiceHandle& operator=(const ServiceHandle&) = delete;
+
+        ServiceHandle(ServiceHandle&& other) noexcept : handle_(other.handle_)
+        {
+            other.handle_ = nullptr;
+        }
+
+        ServiceHandle& operator=(ServiceHandle&& other) noexcept
+        {
+            if (this != &other)
+            {
+                reset();
+                handle_ = other.handle_;
+                other.handle_ = nullptr;
+            }
+            return *this;
+        }
+
+        ~ServiceHandle()
+        {
+            reset();
+        }
+
+        SC_HANDLE get() const noexcept
+        {
+            return handle_;
+        }
+
+        explicit operator bool() const noexcept
+        {
+            return handle_ != nullptr;
+        }
+
+        void reset(SC_HANDLE handle = nullptr) noexcept
+        {
+            if (handle_ != nullptr)
+            {
+                CloseServiceHandle(handle_);
+            }
+            handle_ = handle;
+        }
+
+    private:
+        SC_HANDLE handle_ = nullptr;
+    };
+
+    constexpr const wchar_t* kHelloWorldServiceName = L"PDHelloWorldService";
+    constexpr const wchar_t* kHelloWorldServiceDisplayName = L"PD Hello World Service";
+    constexpr DWORD kServiceCommandTimeoutMs = 30000;
+
+    SERVICE_STATUS g_helloWorldServiceStatus{};
+    SERVICE_STATUS_HANDLE g_helloWorldServiceStatusHandle = nullptr;
+    HANDLE g_helloWorldServiceStopEvent = nullptr;
 
     std::wstring ToUpper(std::wstring value)
     {
@@ -1150,6 +1216,523 @@ namespace
         return 0;
     }
 
+    int PrintWin32Error(const std::wstring& context, const DWORD errorCode = GetLastError())
+    {
+        std::wcerr << context << L": " << GetWin32ErrorMessage(errorCode) << L'\n';
+        return 1;
+    }
+
+    std::optional<std::wstring> GetCurrentExecutablePath()
+    {
+        std::vector<wchar_t> buffer(MAX_PATH, L'\0');
+
+        for (;;)
+        {
+            const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (length == 0)
+            {
+                return std::nullopt;
+            }
+
+            if (length < buffer.size())
+            {
+                return std::wstring(buffer.data(), length);
+            }
+
+            if (buffer.size() >= 32768)
+            {
+                return std::nullopt;
+            }
+
+            buffer.assign(buffer.size() * 2, L'\0');
+        }
+    }
+
+    std::wstring BuildServiceBinaryPath(const std::wstring& executablePath)
+    {
+        return L"\"" + executablePath + L"\" service run";
+    }
+
+    std::wstring ServiceStateToString(const DWORD state)
+    {
+        switch (state)
+        {
+        case SERVICE_STOPPED: return L"STOPPED";
+        case SERVICE_START_PENDING: return L"START_PENDING";
+        case SERVICE_STOP_PENDING: return L"STOP_PENDING";
+        case SERVICE_RUNNING: return L"RUNNING";
+        case SERVICE_CONTINUE_PENDING: return L"CONTINUE_PENDING";
+        case SERVICE_PAUSE_PENDING: return L"PAUSE_PENDING";
+        case SERVICE_PAUSED: return L"PAUSED";
+        default: return L"UNKNOWN";
+        }
+    }
+
+    bool QueryServiceStatusProcess(const SC_HANDLE service, SERVICE_STATUS_PROCESS& status)
+    {
+        DWORD bytesNeeded = 0;
+        return QueryServiceStatusEx(
+                   service,
+                   SC_STATUS_PROCESS_INFO,
+                   reinterpret_cast<LPBYTE>(&status),
+                   sizeof(status),
+                   &bytesNeeded) != FALSE;
+    }
+
+    bool WaitForServiceState(const SC_HANDLE service, const DWORD desiredState, const DWORD timeoutMs)
+    {
+        const ULONGLONG startTick = GetTickCount64();
+
+        for (;;)
+        {
+            SERVICE_STATUS_PROCESS status{};
+            if (!QueryServiceStatusProcess(service, status))
+            {
+                return false;
+            }
+
+            if (status.dwCurrentState == desiredState)
+            {
+                return true;
+            }
+
+            if (status.dwCurrentState == SERVICE_STOPPED && desiredState != SERVICE_STOPPED)
+            {
+                return false;
+            }
+
+            const ULONGLONG elapsedMs = GetTickCount64() - startTick;
+            if (elapsedMs >= timeoutMs)
+            {
+                return false;
+            }
+
+            const DWORD suggestedWait = status.dwWaitHint == 0 ? 1000 : status.dwWaitHint / 10;
+            const DWORD waitMs = std::clamp(suggestedWait, 250UL, 2000UL);
+            Sleep(waitMs);
+        }
+    }
+
+    bool TryShowHelloWorldMessageToActiveSession(const std::wstring& message)
+    {
+        const DWORD sessionId = WTSGetActiveConsoleSessionId();
+        if (sessionId == 0xFFFFFFFF)
+        {
+            return false;
+        }
+
+        std::wstring title = kHelloWorldServiceDisplayName;
+        DWORD response = 0;
+        return WTSSendMessageW(
+                   WTS_CURRENT_SERVER_HANDLE,
+                   sessionId,
+                   const_cast<LPWSTR>(title.c_str()),
+                   static_cast<DWORD>(title.size() * sizeof(wchar_t)),
+                   const_cast<LPWSTR>(message.c_str()),
+                   static_cast<DWORD>(message.size() * sizeof(wchar_t)),
+                   MB_OK | MB_ICONINFORMATION,
+                   30,
+                   &response,
+                   FALSE) != FALSE;
+    }
+
+    void LogServiceEvent(const std::wstring& message, const WORD eventType = EVENTLOG_INFORMATION_TYPE)
+    {
+        HANDLE eventSource = RegisterEventSourceW(nullptr, kHelloWorldServiceName);
+        if (eventSource == nullptr)
+        {
+            return;
+        }
+
+        LPCWSTR strings[] = { message.c_str() };
+        ReportEventW(eventSource, eventType, 0, 1000, nullptr, 1, 0, strings, nullptr);
+        DeregisterEventSource(eventSource);
+    }
+
+    void PublishHelloWorldInitializationMessage()
+    {
+        const std::wstring message = L"Hello World!";
+        const std::wstring debugMessage = std::wstring(kHelloWorldServiceName) + L": " + message + L"\n";
+        OutputDebugStringW(debugMessage.c_str());
+
+        const bool shownToUser = TryShowHelloWorldMessageToActiveSession(message);
+        if (shownToUser)
+        {
+            LogServiceEvent(L"Hello World! Mesajul a fost afisat in sesiunea activa.");
+        }
+        else
+        {
+            LogServiceEvent(L"Hello World! Nu exista o sesiune activa pentru afisare; mesajul a fost publicat in Event Log si debug output.");
+        }
+    }
+
+    void ReportHelloWorldServiceStatus(const DWORD currentState, const DWORD win32ExitCode, const DWORD waitHint)
+    {
+        static DWORD checkPoint = 1;
+
+        if (g_helloWorldServiceStatusHandle == nullptr)
+        {
+            return;
+        }
+
+        g_helloWorldServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+        g_helloWorldServiceStatus.dwCurrentState = currentState;
+        g_helloWorldServiceStatus.dwWin32ExitCode = win32ExitCode;
+        g_helloWorldServiceStatus.dwWaitHint = waitHint;
+        g_helloWorldServiceStatus.dwControlsAccepted =
+            (currentState == SERVICE_RUNNING) ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
+
+        if (currentState == SERVICE_RUNNING || currentState == SERVICE_STOPPED)
+        {
+            g_helloWorldServiceStatus.dwCheckPoint = 0;
+            checkPoint = 1;
+        }
+        else
+        {
+            g_helloWorldServiceStatus.dwCheckPoint = checkPoint++;
+        }
+
+        SetServiceStatus(g_helloWorldServiceStatusHandle, &g_helloWorldServiceStatus);
+    }
+
+    DWORD WINAPI HelloWorldServiceControlHandler(
+        const DWORD control,
+        const DWORD eventType,
+        LPVOID eventData,
+        LPVOID context)
+    {
+        (void)eventType;
+        (void)eventData;
+        (void)context;
+
+        switch (control)
+        {
+        case SERVICE_CONTROL_STOP:
+        case SERVICE_CONTROL_SHUTDOWN:
+            ReportHelloWorldServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 3000);
+            if (g_helloWorldServiceStopEvent != nullptr)
+            {
+                SetEvent(g_helloWorldServiceStopEvent);
+            }
+            return NO_ERROR;
+
+        case SERVICE_CONTROL_INTERROGATE:
+            SetServiceStatus(g_helloWorldServiceStatusHandle, &g_helloWorldServiceStatus);
+            return NO_ERROR;
+
+        default:
+            return ERROR_CALL_NOT_IMPLEMENTED;
+        }
+    }
+
+    void WINAPI HelloWorldServiceMain(DWORD argc, LPWSTR* argv)
+    {
+        (void)argc;
+        (void)argv;
+
+        g_helloWorldServiceStatusHandle = RegisterServiceCtrlHandlerExW(
+            kHelloWorldServiceName,
+            HelloWorldServiceControlHandler,
+            nullptr);
+
+        if (g_helloWorldServiceStatusHandle == nullptr)
+        {
+            return;
+        }
+
+        ReportHelloWorldServiceStatus(SERVICE_START_PENDING, NO_ERROR, 3000);
+
+        g_helloWorldServiceStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (g_helloWorldServiceStopEvent == nullptr)
+        {
+            ReportHelloWorldServiceStatus(SERVICE_STOPPED, GetLastError(), 0);
+            return;
+        }
+
+        PublishHelloWorldInitializationMessage();
+        ReportHelloWorldServiceStatus(SERVICE_RUNNING, NO_ERROR, 0);
+
+        WaitForSingleObject(g_helloWorldServiceStopEvent, INFINITE);
+
+        ReportHelloWorldServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 3000);
+        CloseHandle(g_helloWorldServiceStopEvent);
+        g_helloWorldServiceStopEvent = nullptr;
+        ReportHelloWorldServiceStatus(SERVICE_STOPPED, NO_ERROR, 0);
+    }
+
+    int RunHelloWorldServiceDispatcher()
+    {
+        SERVICE_TABLE_ENTRYW serviceTable[] =
+        {
+            { const_cast<LPWSTR>(kHelloWorldServiceName), HelloWorldServiceMain },
+            { nullptr, nullptr }
+        };
+
+        if (!StartServiceCtrlDispatcherW(serviceTable))
+        {
+            const DWORD error = GetLastError();
+            if (error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT)
+            {
+                std::wcerr << L"Comanda 'service run' este destinata Service Control Manager. "
+                              L"Foloseste 'service install', apoi 'service start'.\n";
+                return 1;
+            }
+
+            return PrintWin32Error(L"Eroare la pornirea dispatcher-ului de service", error);
+        }
+
+        return 0;
+    }
+
+    int InstallHelloWorldService()
+    {
+        const auto executablePath = GetCurrentExecutablePath();
+        if (!executablePath)
+        {
+            return PrintWin32Error(L"Nu pot determina calea executabilului");
+        }
+
+        ServiceHandle manager(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE));
+        if (!manager)
+        {
+            return PrintWin32Error(L"Eroare la deschiderea Service Control Manager");
+        }
+
+        const std::wstring binaryPath = BuildServiceBinaryPath(*executablePath);
+        ServiceHandle service(CreateServiceW(
+            manager.get(),
+            kHelloWorldServiceName,
+            kHelloWorldServiceDisplayName,
+            SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP | DELETE,
+            SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_DEMAND_START,
+            SERVICE_ERROR_NORMAL,
+            binaryPath.c_str(),
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr));
+
+        if (!service)
+        {
+            const DWORD error = GetLastError();
+            if (error == ERROR_SERVICE_EXISTS)
+            {
+                std::wcerr << L"Serviciul exista deja: " << kHelloWorldServiceName << L'\n';
+                return 1;
+            }
+
+            return PrintWin32Error(L"Eroare la crearea serviciului", error);
+        }
+
+        std::wcout << L"Serviciu instalat: " << kHelloWorldServiceName << L'\n';
+        std::wcout << L"Cale pornire: " << binaryPath << L'\n';
+        return 0;
+    }
+
+    int StartHelloWorldService()
+    {
+        ServiceHandle manager(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+        if (!manager)
+        {
+            return PrintWin32Error(L"Eroare la deschiderea Service Control Manager");
+        }
+
+        ServiceHandle service(OpenServiceW(manager.get(), kHelloWorldServiceName, SERVICE_START | SERVICE_QUERY_STATUS));
+        if (!service)
+        {
+            return PrintWin32Error(L"Eroare la deschiderea serviciului");
+        }
+
+        if (!StartServiceW(service.get(), 0, nullptr))
+        {
+            const DWORD error = GetLastError();
+            if (error == ERROR_SERVICE_ALREADY_RUNNING)
+            {
+                std::wcout << L"Serviciul ruleaza deja.\n";
+                return 0;
+            }
+
+            return PrintWin32Error(L"Eroare la pornirea serviciului", error);
+        }
+
+        if (WaitForServiceState(service.get(), SERVICE_RUNNING, kServiceCommandTimeoutMs))
+        {
+            std::wcout << L"Serviciul ruleaza. Mesajul 'Hello World!' este trimis la initializare.\n";
+            return 0;
+        }
+
+        std::wcerr << L"Serviciul a fost pornit, dar nu a ajuns in starea RUNNING in timpul asteptat.\n";
+        return 1;
+    }
+
+    int StopHelloWorldService()
+    {
+        ServiceHandle manager(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+        if (!manager)
+        {
+            return PrintWin32Error(L"Eroare la deschiderea Service Control Manager");
+        }
+
+        ServiceHandle service(OpenServiceW(manager.get(), kHelloWorldServiceName, SERVICE_STOP | SERVICE_QUERY_STATUS));
+        if (!service)
+        {
+            return PrintWin32Error(L"Eroare la deschiderea serviciului");
+        }
+
+        SERVICE_STATUS_PROCESS status{};
+        if (!QueryServiceStatusProcess(service.get(), status))
+        {
+            return PrintWin32Error(L"Eroare la citirea starii serviciului");
+        }
+
+        if (status.dwCurrentState == SERVICE_STOPPED)
+        {
+            std::wcout << L"Serviciul este deja oprit.\n";
+            return 0;
+        }
+
+        SERVICE_STATUS stopStatus{};
+        if (!ControlService(service.get(), SERVICE_CONTROL_STOP, &stopStatus))
+        {
+            const DWORD error = GetLastError();
+            if (error == ERROR_SERVICE_NOT_ACTIVE)
+            {
+                std::wcout << L"Serviciul este deja oprit.\n";
+                return 0;
+            }
+
+            return PrintWin32Error(L"Eroare la oprirea serviciului", error);
+        }
+
+        if (WaitForServiceState(service.get(), SERVICE_STOPPED, kServiceCommandTimeoutMs))
+        {
+            std::wcout << L"Serviciul a fost oprit.\n";
+            return 0;
+        }
+
+        std::wcerr << L"Serviciul nu a ajuns in starea STOPPED in timpul asteptat.\n";
+        return 1;
+    }
+
+    int ShowHelloWorldServiceStatus()
+    {
+        ServiceHandle manager(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+        if (!manager)
+        {
+            return PrintWin32Error(L"Eroare la deschiderea Service Control Manager");
+        }
+
+        ServiceHandle service(OpenServiceW(manager.get(), kHelloWorldServiceName, SERVICE_QUERY_STATUS));
+        if (!service)
+        {
+            return PrintWin32Error(L"Eroare la deschiderea serviciului");
+        }
+
+        SERVICE_STATUS_PROCESS status{};
+        if (!QueryServiceStatusProcess(service.get(), status))
+        {
+            return PrintWin32Error(L"Eroare la citirea starii serviciului");
+        }
+
+        std::wcout << L"Serviciu: " << kHelloWorldServiceName << L'\n';
+        std::wcout << L"Stare   : " << ServiceStateToString(status.dwCurrentState) << L'\n';
+        return 0;
+    }
+
+    int UninstallHelloWorldService()
+    {
+        ServiceHandle manager(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+        if (!manager)
+        {
+            return PrintWin32Error(L"Eroare la deschiderea Service Control Manager");
+        }
+
+        ServiceHandle service(OpenServiceW(
+            manager.get(),
+            kHelloWorldServiceName,
+            DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS));
+
+        if (!service)
+        {
+            return PrintWin32Error(L"Eroare la deschiderea serviciului");
+        }
+
+        SERVICE_STATUS_PROCESS status{};
+        if (QueryServiceStatusProcess(service.get(), status) && status.dwCurrentState != SERVICE_STOPPED)
+        {
+            SERVICE_STATUS stopStatus{};
+            if (ControlService(service.get(), SERVICE_CONTROL_STOP, &stopStatus))
+            {
+                WaitForServiceState(service.get(), SERVICE_STOPPED, kServiceCommandTimeoutMs);
+            }
+        }
+
+        if (!DeleteService(service.get()))
+        {
+            return PrintWin32Error(L"Eroare la stergerea serviciului");
+        }
+
+        std::wcout << L"Serviciul a fost dezinstalat: " << kHelloWorldServiceName << L'\n';
+        return 0;
+    }
+
+    void PrintServiceUsage()
+    {
+        std::wcout
+            << L"Comenzi service:\n"
+            << L"  PDApp service install\n"
+            << L"  PDApp service start\n"
+            << L"  PDApp service status\n"
+            << L"  PDApp service stop\n"
+            << L"  PDApp service uninstall\n";
+    }
+
+    int HandleHelloWorldServiceCommand(const int argc, wchar_t* argv[])
+    {
+        if (argc != 3)
+        {
+            PrintServiceUsage();
+            return 1;
+        }
+
+        const std::wstring action = ToUpper(argv[2]);
+
+        if (action == L"INSTALL")
+        {
+            return InstallHelloWorldService();
+        }
+
+        if (action == L"START")
+        {
+            return StartHelloWorldService();
+        }
+
+        if (action == L"STATUS")
+        {
+            return ShowHelloWorldServiceStatus();
+        }
+
+        if (action == L"STOP")
+        {
+            return StopHelloWorldService();
+        }
+
+        if (action == L"UNINSTALL" || action == L"DELETE")
+        {
+            return UninstallHelloWorldService();
+        }
+
+        if (action == L"RUN")
+        {
+            return RunHelloWorldServiceDispatcher();
+        }
+
+        PrintServiceUsage();
+        return 1;
+    }
+
     void PrintUsage()
     {
         std::wcout
@@ -1158,11 +1741,14 @@ namespace
             << L"  PDApp registry <cale-completa-registry>\n"
             << L"  PDApp devices\n"
             << L"  PDApp device <index>\n"
-            << L"  PDApp device-id <instance-id>\n\n"
+            << L"  PDApp device-id <instance-id>\n"
+            << L"  PDApp service <install|start|status|stop|uninstall>\n\n"
             << L"Exemple:\n"
             << L"  PDApp registry HKLM \"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"\n"
             << L"  PDApp devices\n"
-            << L"  PDApp device 0\n";
+            << L"  PDApp device 0\n"
+            << L"  PDApp service install\n"
+            << L"  PDApp service start\n";
     }
 }
 
@@ -1252,6 +1838,11 @@ int wmain(const int argc, wchar_t* argv[])
         }
 
         return ShowDeviceMetadataBySelection(*selection);
+    }
+
+    if (command == L"SERVICE")
+    {
+        return HandleHelloWorldServiceCommand(argc, argv);
     }
 
     PrintUsage();
